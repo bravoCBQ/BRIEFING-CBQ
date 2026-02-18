@@ -42,6 +42,33 @@ st.markdown("""
         font-weight: 600;
         box-shadow: 0 2px 5px rgba(0,0,0,0.1);
     }
+    .mel-item {
+        background-color: #f8f9fa;
+        padding: 10px;
+        border-radius: 8px;
+        margin-bottom: 8px;
+        border-left: 4px solid #6c757d;
+    }
+    .met-badge {
+        display: inline-block;
+        padding: 5px 12px;
+        border-radius: 15px;
+        margin: 3px;
+        font-weight: 700;
+        color: white;
+    }
+    .low-vis {
+        background-color: #dc3545;
+        animation: pulse 2s infinite;
+    }
+    .normal-vis {
+        background-color: #28a745;
+    }
+    @keyframes pulse {
+        0% { opacity: 1; }
+        50% { opacity: 0.7; }
+        100% { opacity: 1; }
+    }
     /* Optimización para móviles */
     @media (max-width: 640px) {
         .metric-card h2 {
@@ -167,6 +194,34 @@ def main():
                         </div>
                     """, unsafe_allow_html=True)
 
+                    # --- NUEVAS SECCIONES: MEL y MET ---
+                    col_mel, col_met = st.columns(2)
+                    
+                    with col_mel:
+                        st.subheader("🛠️ MEL Items")
+                        if summary.get("mel_items"):
+                            for item in summary["mel_items"]:
+                                st.markdown(f"""
+                                    <div class="mel-item">
+                                        <b style="color: #007bff;">{item['number']} (Level {item['level']})</b><br>
+                                        <span style="font-size: 0.9em; color: #444;">{item['description']}</span>
+                                    </div>
+                                """, unsafe_allow_html=True)
+                        else:
+                            st.info("No se detectaron MEL items diferidos.")
+
+                    with col_met:
+                        st.subheader("🌡️ Meteorología (Visibilidad)")
+                        if summary.get("meteorologia"):
+                            met_html = ""
+                            for met in summary["meteorologia"]:
+                                cls = "low-vis" if met['low_vis'] else "normal-vis"
+                                vis_str = "CAVOK" if met['visibility'] >= 9999 else f"{met['visibility']}m"
+                                met_html += f'<div class="met-badge {cls}">{met["airport"]}: {vis_str}</div>'
+                            st.markdown(f'<div style="background: white; padding: 15px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.05);">{met_html}</div>', unsafe_allow_html=True)
+                        else:
+                            st.info("No se detectó información detallada de visibilidad en METARs.")
+
                     st.subheader("👥 Tripulación Detectada")
                     crew_html = "".join([f'<span class="crew-badge">{person}</span>' for person in summary['tripulacion']])
                     st.markdown(f'<div style="background: white; padding: 15px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.05);">{crew_html}</div>', unsafe_allow_html=True)
@@ -182,11 +237,23 @@ def main():
                         for deg, pts in summary["turbulencias_repetidas"].items():
                             extra_turb += f"- 🔄 REPETIDAS ({deg:02}): " + ", ".join([f"{t['punto']} ({t['eet']})" for t in pts]) + "\n"
 
+                    # Preparar texto de MEL
+                    mel_text = ""
+                    if summary.get("mel_items"):
+                        mel_text = "🛠️ MEL ITEMS:\n" + "\n".join([f"- {m['number']} ({m['level']}): {m['description']}" for m in summary['mel_items']]) + "\n\n"
+
+                    # Preparar texto de Meteorología
+                    met_text = ""
+                    if summary.get("meteorologia"):
+                        met_text = "🌡️ VISIBILIDAD:\n" + ", ".join([f"{m['airport']}: {m['visibility']}m" for m in summary['meteorologia']]) + "\n\n"
+
                     summary_text = (
                         f"✈️ RESUMEN DE VUELO\n--------------------\n"
                         f"Vuelo: {summary['vuelo']}\n"
                         f"Matrícula: {summary['matricula']}\n"
                         f"Tiempo: {summary['tiempo_vuelo']}\n\n"
+                        f"{mel_text}"
+                        f"{met_text}"
                         f"⚖️ LIMITACIONES DE PESO:\n"
                         f"- Limitación: {summary['limitacion_peso']} ({summary['limitacion_valor']})\n"
                         f"- Margen: {summary['limitacion_margen']} kg {'(CRÍTICA)' if summary['limitacion_critica'] else ''}\n\n"

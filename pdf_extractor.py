@@ -1,345 +1,198 @@
 import pdfplumber
-import os
-import json
-import pandas as pd
+import fitz  # PyMuPDF
 import re
-from datetime import datetime
+import json
+import os
 
 class HighPrecisionPDFExtractor:
-    def __init__(self, file_path):
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"El archivo {file_path} no existe.")
-        self.file_path = file_path
-        self.filename = os.path.basename(file_path)
+    def __init__(self, pdf_path):
+        self.pdf_path = pdf_path
+        self.summary = {
+            'vuelo': 'N/A',
+            'matricula': 'N/A',
+            'tiempo_vuelo': 'N/A',
+            'viento_arribo': '000/00',
+            'pista_uso': 'N/A',
+            'limitacion_peso': 'N/A',
+            'limitacion_valor': '0',
+            'limitacion_margen': '0',
+            'limitacion_critica': False,
+            'tripulacion': [],
+            'turbulencia_max': '00',
+            'turbulencia_loc': 'N/A',
+            'turbulencias_severas': [],
+            'turbulencias_repetidas': {},
+            'mel_items': [],
+            'meteorologia': []
+        }
+        self._extract_all()
 
-    def extract_text_as_is(self):
-        """Extrae el texto intentando mantener la estructura visual exacta."""
-        extracted_data = []
-        with pdfplumber.open(self.file_path) as pdf:
-            for i, page in enumerate(pdf.pages):
-                # Usamos layout=True para mantener la posición visual del texto
-                text = page.extract_text(layout=True)
-                extracted_data.append({
-                    "page": i + 1,
-                    "content": text
-                })
-        return extracted_data
+    def _extract_all(self):
+        try:
+            with pdfplumber.open(self.pdf_path) as pdf:
+                full_text = ""
+                for i, page in enumerate(pdf.pages):
+                    text = page.extract_text() or ""
+                    full_text += f"\n--- PAGE {i+1} ---\n{text}"
+                    
+                    if i == 0:
+                        self._extract_crew(text)
+                    
+                    # Page 13 usually has the clean flight summary line
+                    if i == 12: 
+                        self._extract_flight_summary_line(text)
+                    
+                    if "DEFERRED ITEM LIST" in text:
+                        self._extract_mel_advanced(text)
+                
+                self._extract_basic_info_fallback(full_text)
+                self._extract_turbulence(full_text)
+                self._extract_weights_advanced(full_text)
+                self._extract_met_advanced(full_text)
+                
+        except Exception as e:
+            print(f"Error extracting PDF data: {e}")
 
-    def extract_tables(self):
-        """Extrae tablas de forma estructurada."""
-        all_tables = []
-        with pdfplumber.open(self.file_path) as pdf:
-            for i, page in enumerate(pdf.pages):
-                tables = page.extract_tables()
-                for j, table in enumerate(tables):
-                    if not table or not table[0]: continue
-                    # Filtrar columnas None
-                    headers = [h if h else f"Col_{idx}" for idx, h in enumerate(table[0])]
-                    df = pd.DataFrame(table[1:], columns=headers)
-                    all_tables.append({
-                        "page": i + 1,
-                        "table_index": j,
-                        "data": df.to_dict(orient="records")
+    def _extract_flight_summary_line(self, text):
+        # Sample: LAN809 02FEB26 CCBGE LA789 SCEL 0425 YSSY 1915
+        match = re.search(r'([A-Z]{3}\d{3,4})\s+\d{2}[A-Z]{3}\d{2}\s+([A-Z]{2}[A-Z]{3})', text)
+        if match:
+            self.summary['vuelo'] = match.group(1)
+            reg = match.group(2)
+            if '-' not in reg and len(reg) == 5:
+                reg = f"{reg[:2]}-{reg[2:]}"
+            self.summary['matricula'] = reg
+
+    def _extract_basic_info_fallback(self, text):
+        if self.summary['vuelo'] == 'N/A':
+            match = re.search(r'Flight\s+([A-Z0-9-]+)', text)
+            if match: self.summary['vuelo'] = match.group(1)
+        
+        if self.summary['matricula'] == 'N/A':
+            match = re.search(r'Acft\.\s+Regist\s+([A-Z0-9-]+)', text)
+            if match: self.summary['matricula'] = match.group(1)
+
+        # Better flight time extraction from Page 1 area
+        # Schedule LT 01:25 06:15 -> Time Difference or Total
+        # Usually it's in the Briefing summary area
+        time_match = re.search(r'(\d{1,2}h\s+\d{1,2}m)', text)
+        if time_match:
+            self.summary['tiempo_vuelo'] = time_match.group(1)
+
+    def _extract_crew(self, text):
+        crew_lines = text.split('\n')
+        recording = False
+        for line in crew_lines:
+            if "POS" in line and "Name" in line:
+                recording = True
+                continue
+            if recording:
+                if not line.strip() or "Cabin Crew" in line or "Flight Info" in line:
+                    if "Cabin Crew" in line: continue
+                    if "Flight Info" in line: break
+                    continue
+                
+                # Match POS Name BP
+                # CP CRISTIAN MELO DASTRES 01338177 14108348-1
+                match = re.search(r'^\s*([A-Z]{2,3})\s+(.*?)\s+\d{8}', line)
+                if match:
+                    pos = match.group(1)
+                    name = match.group(2).strip()
+                    self.summary['tripulacion'].append(f"{pos}: {name}")
+
+    def _extract_mel_advanced(self, text):
+        # Sample: MOC N° 553449 L WING LIGHT INOP. T00XASQN
+        # MEL C-33-41-01 LIMOPS: YES
+        mocs = re.findall(r'MOC N°\s+(\d+)\s+(.*?)\s+T00', text)
+        mels = re.findall(r'MEL\s+([A-D])-(\d{2}-\d{2}-\d{2})', text)
+        
+        for i in range(min(len(mocs), len(mels))):
+            self.summary['mel_items'].append({
+                'number': mels[i][1],
+                'level': mels[i][0],
+                'description': mocs[i][1].strip()
+            })
+
+    def _extract_turbulence(self, full_text):
+        # Look for the Nav Log section
+        # Format: [WAYPOINT] [NUM] [NUM]
+        # We also want to exclude "PAGE", "SIGMET", "creation", "UTC"
+        exclude = ["PAGE", "SIGMET", "UTC", "TIME", "FILE", "DATE"]
+        lines = full_text.split('\n')
+        max_turb = 0
+        max_loc = "N/A"
+        repeated = {}
+
+        for line in lines:
+            # Look for waypoint name (4-5 letters) followed by turbulence (1-2 digits) and Flight Level (3 digits)
+            match = re.search(r'\b([A-Z0-9]{4,5})\b\s+(\d{1,2})\b\s+(\d{3})\b', line)
+            if match:
+                wpt = match.group(1)
+                if any(x in wpt for x in exclude): continue
+                
+                turb = int(match.group(2))
+                if turb > max_turb:
+                    max_turb = turb
+                    max_loc = wpt
+                
+                if turb >= 5:
+                    t_str = str(turb)
+                    if t_str not in repeated:
+                        repeated[t_str] = []
+                    if wpt not in repeated[t_str]:
+                        repeated[t_str].append(wpt)
+
+        self.summary['turbulencia_max'] = f"{max_turb:02d}"
+        self.summary['turbulencia_loc'] = max_loc
+        self.summary['turbulencias_repetidas'] = {k: v for k, v in repeated.items() if len(v) > 1}
+
+    def _extract_weights_advanced(self, full_text):
+        # Look for more specific patterns for Weights
+        # EZFW 157867 ...
+        zfw_match = re.search(r'EZFW\s+(\d{6})', full_text)
+        tow_match = re.search(r'ETOW\s+(\d{6})', full_text)
+        if zfw_match:
+            self.summary['limitacion_peso'] = 'EZFW'
+            self.summary['limitacion_valor'] = zfw_match.group(1)
+        elif tow_match:
+            self.summary['limitacion_peso'] = 'ETOW'
+            self.summary['limitacion_valor'] = tow_match.group(1)
+
+    def _extract_met_advanced(self, full_text):
+        # METARs
+        # Pattern: SCEL -SCL - SANTIAGO INTL
+        # followed by SA 020100Z ...
+        # Simplified: Find [ICAO] -[ANY] and then SA [TIME]
+        sections = re.findall(r'([A-Z]{4})\s+-\s+.*?(?=([A-Z]{4}\s+-\s+|$))', full_text, re.DOTALL)
+        
+        seen_airports = set()
+        for apt, next_lookahead in sections:
+            if apt in seen_airports or len(apt) != 4: continue
+            
+            # Find the block belonging to this apt
+            # We search for SA after the apt name until the next apt or EOF
+            pattern = re.escape(apt) + r'\s+-.*?SA\s+\d{6}Z\s+(.*?)(?=[A-Z]{4}\s+-\s+|$)'
+            sa_match = re.search(pattern, full_text, re.DOTALL)
+            
+            if sa_match:
+                metar_text = sa_match.group(1)
+                # Extract visibility: 9999, 4000, 0800, CAVOK, 1/4SM
+                vis_match = re.search(r'\b(\d{4}|CAVOK)\b', metar_text)
+                if vis_match:
+                    vis = vis_match.group(1)
+                    vis_val = 9999 if vis == 'CAVOK' else int(vis)
+                    self.summary['meteorologia'].append({
+                        'airport': apt,
+                        'visibility': vis_val,
+                        'low_vis': vis_val < 2000
                     })
-        return all_tables
+                    seen_airports.add(apt)
+
 
     def get_flight_summary(self):
-        """Genera un resumen del vuelo extrayendo datos clave."""
-        text_data = self.extract_text_as_is()
-        all_text = "\n".join([p['content'] for p in text_data])
-        first_page_text = text_data[0]['content'] if text_data else ""
-        
-        summary = {
-            "vuelo": "No encontrado",
-            "matricula": "No encontrada",
-            "tiempo_vuelo": "No calculado",
-            "turbulencia_max": "N/A",
-            "turbulencia_loc": "N/A",
-            "viento_arribo": "N/A",
-            "pista_uso": "N/A",
-            "tripulacion": []
-        }
-
-        # 1. Extraer Número de Vuelo (Formato LAN-XXX o LANXXXX)
-        flight_match = re.search(r"LAN-?(\d+)", first_page_text)
-        if flight_match:
-            summary["vuelo"] = f"LAN-{flight_match.group(1)}"
-
-        # 2. Extraer Matrícula (Formato CC-XXX)
-        reg_match = re.search(r"CC-[A-Z]{3}", first_page_text)
-        if reg_match:
-            summary["matricula"] = reg_match.group(0)
-
-        # 3. Extraer Tiempo de Vuelo y ETA (Calculando diferencia entre Schedule UTC)
-        # Ejemplo: Schedule UTC 04:25 19:15
-        time_match = re.search(r"Schedule UTC\s+(\d{2}:\d{2})\s+(\d{2}:\d{2})", first_page_text)
-        eta_str = ""
-        if time_match:
-            t1_str = time_match.group(1)
-            t2_str = time_match.group(2)
-            eta_str = t2_str
-            fmt = "%H:%M"
-            t1 = datetime.strptime(t1_str, fmt)
-            t2 = datetime.strptime(t2_str, fmt)
-            
-            # Calcular diferencia
-            delta = t2 - t1
-            total_seconds = delta.total_seconds()
-            if total_seconds < 0:
-                total_seconds += 24 * 3600  # Manejar cruce de día
-                
-            hours = int(total_seconds // 3600)
-            minutes = int((total_seconds % 3600) // 60)
-            summary["tiempo_vuelo"] = f"{hours}h {minutes}m"
-
-        # 4. Extraer Turbulencia Máxima (MXWSR)
-        # Buscamos MXWSR 04/5080W
-        turb_match = re.search(r"MXWSR\s+(\d{2})/([A-Z0-9]+)", all_text)
-        if turb_match:
-            summary["turbulencia_max"] = turb_match.group(1)
-            summary["turbulencia_loc"] = turb_match.group(2)
-
-        # 5. Extraer Pista de Arribo
-        # Buscamos el destino en la Navigation Summary o Log (ej: YSSY/16L)
-        # Primero identificamos el destino (Route SCL SYD)
-        dest_match = re.search(r"Route\s+[A-Z]{3}\s+([A-Z]{3})", first_page_text)
-        dest_code = ""
-        if dest_match:
-            dest_code = dest_match.group(1)
-            # Buscar ICAO del destino y la pista (ej: YSSY/16L)
-            # En el Nav Log suele aparecer como YSSY/16L
-            rwy_match = re.search(fr"Y[A-Z]{{3}}/(\d{{2}}[RCL]?)", all_text)
-            if rwy_match:
-                summary["pista_uso"] = rwy_match.group(1)
-
-        # 6. Extraer Viento de Arribo (TAF)
-        if dest_code and eta_str:
-            # Intentar encontrar el ICAO completo (ej: YSSY)
-            icao_match = re.search(fr"([A-Z]{4})\s+-\s+[A-Z]{3}\s+-\s+{dest_code}?", all_text)
-            icao = ""
-            if icao_match:
-                icao = icao_match.group(1)
-            else:
-                if dest_code == "SYD": icao = "YSSY"
-                elif dest_code == "SCL": icao = "SCEL"
-                elif dest_code == "MEL": icao = "YMML"
-                elif dest_code == "IPC": icao = "SCIP"
-            
-            if icao:
-                taf_match = re.search(fr"{icao}.*?\n\s+(?:FT|TAF).*?\n(.*?)(?=\n\s+[A-Z]{{4}}|\n\n|$)", all_text, re.DOTALL)
-                if not taf_match:
-                    taf_match = re.search(fr"{icao}.*?\n\s+(?:FT|TAF)\s+.*?\n(.*?)(?==|$)", all_text, re.DOTALL)
-                
-                if taf_match:
-                    taf_content = taf_match.group(1)
-                    winds = re.findall(r"(\d{3})(\d{2,3})(?:G\d{2})?KT", taf_content)
-                    if winds:
-                        last_wind = winds[-1]
-                        summary["viento_arribo"] = f"{last_wind[0]}{last_wind[1]}KT"
-
-        # 7. Lógica Avanzada de Turbulencia (Nav Log Parsing)
-        # Extraer EET (ACT) y WSR (Turbulencia) de cada waypoint
-        coord_pattern = r"([SN]\d{4}\.\d\s+[WE]\d{5}\.\d)\s+(\d{3})\s+(\w{3})\s+(\d{3})\s+(\d{3}/\d{3})\s+(\d{2})\s+(\d{4,})\s+(\d{4,})\s+(\d{4})"
-        matches = list(re.finditer(coord_pattern, all_text))
-        
-        all_turbulences = []
-        waypoint_eets = {} # Para mapear waypoint -> EET
-        
-        for m in matches:
-            wsr = int(m.group(6))
-            act = m.group(9)
-            eta_eet = f"{act[:2]}:{act[2:]}"
-            
-            # Buscar nombre del waypoint (retroceder líneas hasta encontrarlo)
-            start_idx = m.start()
-            preceding_text = all_text[:start_idx]
-            prev_lines = [l.strip() for l in preceding_text.splitlines() if l.strip()]
-            
-            wp_name = "UNKNOWN"
-            if prev_lines:
-                # El nombre suele estar en la línea inmediatamente superior o una más arriba
-                # Intentamos buscar el primer token alfanumérico largo
-                for i in range(1, min(4, len(prev_lines) + 1)):
-                    potential_wp = re.search(r"^([A-Z0-9/\-]+)", prev_lines[-i])
-                    if potential_wp:
-                        wp_name = potential_wp.group(1)
-                        if wp_name not in ["NAVIGATION", "LATAM", "POSN", "COORD"]: # Filtrar encabezados
-                            break
-            
-            waypoint_eets[wp_name] = eta_eet
-            if wsr > 0:
-                all_turbulences.append({
-                    "grado": wsr,
-                    "punto": wp_name,
-                    "eet": eta_eet
-                })
-
-        # Determinar la Turbulencia Máxima Absoluta
-        max_wsr_val = -1
-        max_wsr_loc = "N/A"
-        
-        # 1. Considerar MXWSR del resumen
-        mxwsr_match = re.search(r"MXWSR\s+(\d{2})/([A-Z0-9]+)", all_text)
-        if mxwsr_match:
-            max_wsr_val = int(mxwsr_match.group(1))
-            mx_punto = mxwsr_match.group(2)
-            mx_eet = waypoint_eets.get(mx_punto, "N/A")
-            max_wsr_loc = f"{mx_punto} ({mx_eet})"
-
-        # 2. Comparar con todos los puntos del log
-        if all_turbulences:
-            sorted_turb = sorted(all_turbulences, key=lambda x: x['grado'], reverse=True)
-            log_max = sorted_turb[0]
-            if log_max['grado'] > max_wsr_val:
-                max_wsr_val = log_max['grado']
-                max_wsr_loc = f"{log_max['punto']} ({log_max['eet']})"
-        
-        if max_wsr_val != -1:
-            summary["turbulencia_max"] = f"{max_wsr_val:02}"
-            summary["turbulencia_loc"] = max_wsr_loc
-
-        # Turbulencias > 5 (Severas)
-        summary["turbulencias_severas"] = [t for t in all_turbulences if t['grado'] > 5]
-        
-        # Repeticiones > 4
-        degree_counts = {}
-        for t in all_turbulences:
-            if t['grado'] > 4:
-                degree_counts[t['grado']] = degree_counts.get(t['grado'], []) + [t]
-        
-        summary["turbulencias_repetidas"] = {deg: pts for deg, pts in degree_counts.items() if len(pts) >= 2}
-
-        # 8. Extraer Pesos y Limitaciones (MZFW, MTOW, MLDW vs EZFW, ETOW, ELDW)
-        # EZFW 157867 ... MZFW 181436
-        # ETOW 252650 ... MTOW 252650
-        # ELDW 169741 ... MLDW 192776
-        weights = {
-            "ZFW": re.search(r"EZFW\s+(\d+).*?MZFW\s+(\d+)", all_text),
-            "TOW": re.search(r"ETOW\s+(\d+).*?MTOW\s+(\d+)", all_text),
-            "LDW": re.search(r"ELDW\s+(\d+).*?MLDW\s+(\d+)", all_text)
-        }
-        
-        limit_name = "N/A"
-        limit_val = "N/A"
-        limit_margin = float('inf')
-        limit_critical = False
-
-        for key, match in weights.items():
-            if match:
-                est = int(match.group(1))
-                max_w = int(match.group(2))
-                margin = max_w - est
-                if margin < limit_margin:
-                    limit_margin = margin
-                    limit_name = key
-                    limit_val = f"{est} / {max_w}"
-                    limit_critical = margin < 1000
-        
-        summary["limitacion_peso"] = limit_name
-        summary["limitacion_valor"] = limit_val
-        summary["limitacion_margen"] = limit_margin if limit_margin != float('inf') else "N/A"
-        summary["limitacion_critica"] = limit_critical
-
-        # 8. Extraer Tripulación (Cockpit y Cabin Crew)
-        lines = first_page_text.split("\n")
-        in_crew_section = False
-        for line in lines:
-            if "Cockpit Crew" in line or "Cabin Crew" in line:
-                in_crew_section = True
-                continue
-            
-            if in_crew_section:
-                if "POS" in line and "Name" in line:
-                    continue
-                if "Flight Info" in line or not line.strip():
-                    if not line.strip(): continue
-                    in_crew_section = False
-                    continue
-                
-                match = re.search(r"(?:CMD|CP|FO|CCM|BCC|CC)\s+([A-Z\s]{10,})", line)
-                if match:
-                    name = match.group(1).strip()
-                    name = re.sub(r"\s+\d+.*$", "", name).strip()
-                    if name and name not in summary["tripulacion"]:
-                        summary["tripulacion"].append(name)
-
-        return summary
-
-    def save_to_text(self, output_path):
-        """Guarda la extracción visual en un archivo de texto."""
-        data = self.extract_text_as_is()
-        summary = self.get_flight_summary()
-        
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write("========================================\n")
-            f.write("           RESUMEN DEL VUELO            \n")
-            f.write("========================================\n")
-            f.write(f"Vuelo: {summary['vuelo']}\n")
-            f.write(f"Matrícula: {summary['matricula']}\n")
-            f.write(f"Tiempo de Vuelo: {summary['tiempo_vuelo']}\n")
-            f.write(f"Turbulencia Máxima: {summary['turbulencia_max']}\n")
-            f.write(f"Ubicación Estimada: {summary['turbulencia_loc']}\n")
-            f.write(f"Viento de Arribo: {summary['viento_arribo']}\n")
-            f.write(f"Pista en Uso: {summary['pista_uso']}\n")
-            f.write(f"Limitación Más Restrictiva: {summary['limitacion_peso']} ({summary['limitacion_valor']})\n")
-            f.write(f"Margen: {summary['limitacion_margen']} kg {'(CRÍTICA)' if summary['limitacion_critica'] else ''}\n")
-            f.write("Tripulación:\n")
-            for person in summary['tripulacion']:
-                f.write(f" - {person}\n")
-            f.write("========================================\n\n")
-            
-            for page in data:
-                f.write(f"--- PÁGINA {page['page']} ---\n")
-                f.write(page['content'] if page['content'] else "[Página vacía o imagen]")
-                f.write("\n\n")
-        return output_path
-
-    def save_to_json(self, output_path):
-        """Guarda toda la información (texto y tablas) en un JSON."""
-        summary = self.get_flight_summary()
-        result = {
-            "metadata": {
-                "filename": self.filename,
-                "pages": 0,
-                "flight_summary": summary
-            },
-            "pages": self.extract_text_as_is(),
-            "tables": self.extract_tables()
-        }
-        with pdfplumber.open(self.file_path) as pdf:
-            result["metadata"]["pages"] = len(pdf.pages)
-            
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=4)
-        return output_path
+        return self.summary
 
 if __name__ == "__main__":
-    # Ejemplo de uso
-    input_pdf = "muestra.pdf"
-    if os.path.exists(input_pdf):
-        extractor = HighPrecisionPDFExtractor(input_pdf)
-        
-        print(f"Procesando {input_pdf}...")
-        
-        # Generar Resumen en Consola
-        summary = extractor.get_flight_summary()
-        print("\n--- RESUMEN DETECTADO ---")
-        print(f"Vuelo: {summary['vuelo']}")
-        print(f"Matrícula: {summary['matricula']}")
-        print(f"Tiempo de Vuelo: {summary['tiempo_vuelo']}")
-        print(f"Tripulación ({len(summary['tripulacion'])} personas):")
-        for p in summary['tripulacion']:
-            print(f"  - {p}")
-        print("-------------------------\n")
-        
-        # Guardar como texto plano estructurado
-        txt_output = "resultado_extraccion.txt"
-        extractor.save_to_text(txt_output)
-        print(f"Texto extraído y resumen guardados en: {txt_output}")
-        
-        # Guardar como JSON para análisis de datos
-        json_output = "resultado_analisis.json"
-        extractor.save_to_json(json_output)
-        print(f"Datos estructurados guardados en: {json_output}")
-    else:
-        print("No se encontró el archivo 'muestra.pdf' en el directorio.")
+    # Test
+    extractor = HighPrecisionPDFExtractor("muestra.pdf")
+    print(json.dumps(extractor.get_flight_summary(), indent=4))
