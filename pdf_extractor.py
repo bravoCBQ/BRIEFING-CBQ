@@ -72,28 +72,44 @@ class HighPrecisionPDFExtractor:
             match = re.search(r'Acft\.\s+Regist\s+([A-Z0-9-]+)', text)
             if match: self.summary['matricula'] = match.group(1)
 
-        # Better flight time extraction from Page 1 area
-        # Schedule LT 01:25 06:15 -> Time Difference or Total
-        # Usually it's in the Briefing summary area
-        time_match = re.search(r'(\d{1,2}h\s+\d{1,2}m)', text)
+        # Total flight time from LATAM FLIGHT RELEASE section
+        # Sample: DEST YSSY 82909 1351 (1351 is time)
+        time_match = re.search(r'DEST\s+[A-Z]{4}\s+\d+\s+(\d{2})(\d{2})', text)
         if time_match:
-            self.summary['tiempo_vuelo'] = time_match.group(1)
+            hh, mm = time_match.group(1), time_match.group(2)
+            self.summary['tiempo_vuelo'] = f"{hh}h {mm}m"
+
+        # Arrival Wind and Runway from Navigation Summary / Nav Log
+        # Sample: ... RIVET DCT YSSYR16L ... AVG WIND 248/029
+        # Destination YSSY is standard for this user based on log
+        
+        # 1. Runway: Look for YSSYR[Number][LRC]
+        rwy_match = re.search(r'YSSYR(\d{2}[LRC])', text)
+        if rwy_match:
+            self.summary['pista_uso'] = rwy_match.group(1)
+        
+        # 2. Wind: Look for YSSY METAR/TAF wind specifically
+        # Pattern: YSSY -SYD - SYDNEY K.SMITH.\nSA 020100Z 19023KT
+        wind_match = re.search(r'YSSY\s+-SYD\s+-.*?\nSA\s+\d{6}Z\s+([A-Z0-9]{5})KT', text, re.DOTALL)
+        if wind_match:
+            wind_raw = wind_match.group(1)
+            self.summary['viento_arribo'] = f"{wind_raw[:3]}/{wind_raw[3:]}"
+        else:
+            # Fallback to TAF if METAR SA is missing
+            taf_wind = re.search(r'YSSY\s+-SYD\s+-.*?\nFT\s+\d{6}Z\s+\d{4}\/\d{4}\s+([A-Z0-9]{5})KT', text, re.DOTALL)
+            if taf_wind:
+                wind_raw = taf_wind.group(1)
+                self.summary['viento_arribo'] = f"{wind_raw[:3]}/{wind_raw[3:]}"
 
     def _extract_crew(self, text):
-        crew_lines = text.split('\n')
-        recording = False
-        for line in crew_lines:
-            if "POS" in line and "Name" in line:
-                recording = True
-                continue
-            if recording:
-                if not line.strip() or "Cabin Crew" in line or "Flight Info" in line:
-                    if "Cabin Crew" in line: continue
-                    if "Flight Info" in line: break
-                    continue
-                
-                # Match POS Name BP
-                # CP CRISTIAN MELO DASTRES 01338177 14108348-1
+        # Improved crew extraction to handle Cockpit Crew specifically first
+        # We search specifically for CMD, CP, FO positions
+        cockpit_match = re.search(r'Cockpit Crew(.*?)(?:Cabin Crew|$)', text, re.DOTALL)
+        if cockpit_match:
+            lines = cockpit_match.group(1).split('\n')
+            for line in lines:
+                # CMD CLAUDIO MARCELO BRAVO QUEZADA 00002726
+                # CP CRISTIAN MELO DASTRES 01338177
                 match = re.search(r'^\s*([A-Z]{2,3})\s+(.*?)\s+\d{8}', line)
                 if match:
                     pos = match.group(1)
@@ -101,16 +117,14 @@ class HighPrecisionPDFExtractor:
                     self.summary['tripulacion'].append(f"{pos}: {name}")
 
     def _extract_mel_advanced(self, text):
-        # Sample: MOC N° 553449 L WING LIGHT INOP. T00XASQN
-        # MEL C-33-41-01 LIMOPS: YES
-        mocs = re.findall(r'MOC N°\s+(\d+)\s+(.*?)\s+T00', text)
-        mels = re.findall(r'MEL\s+([A-D])-(\d{2}-\d{2}-\d{2})', text)
-        
-        for i in range(min(len(mocs), len(mels))):
+        # Re-evaluating MEL extraction from PÁGINA 3 format
+        # Sample: 33-41-01 MEL C L WING LIGHT INOP.
+        items = re.findall(r'(\d{2}-\d{2}-\d{2})\s+MEL\s+([A-D])\s+(.*?)(?=\s+\d{2}/\d{2}|PROCEDURE|$)', text)
+        for num, lvl, desc in items:
             self.summary['mel_items'].append({
-                'number': mels[i][1],
-                'level': mels[i][0],
-                'description': mocs[i][1].strip()
+                'number': num,
+                'level': lvl,
+                'description': desc.strip()
             })
 
     def _extract_turbulence(self, full_text):
