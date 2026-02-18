@@ -161,16 +161,43 @@ class HighPrecisionPDFExtractor:
         self.summary['turbulencias_repetidas'] = {k: v for k, v in repeated.items() if len(v) > 1}
 
     def _extract_weights_advanced(self, full_text):
-        # Look for more specific patterns for Weights
-        # EZFW 157867 ...
-        zfw_match = re.search(r'EZFW\s+(\d{6})', full_text)
-        tow_match = re.search(r'ETOW\s+(\d{6})', full_text)
-        if zfw_match:
-            self.summary['limitacion_peso'] = 'EZFW'
-            self.summary['limitacion_valor'] = zfw_match.group(1)
-        elif tow_match:
-            self.summary['limitacion_peso'] = 'ETOW'
-            self.summary['limitacion_valor'] = tow_match.group(1)
+        # Extract pairs of (Estimated, Maximum)
+        # Sample: EZFW 157867 ... MZFW 181436
+        # Sample: ETOW 252650 ... MTOW 252650
+        # Sample: ELDW 169741 ... MLDW 192776
+        
+        weights_found = []
+        
+        patterns = {
+            'ZFW': (r'EZFW\s+(\d+)', r'MZFW\s+(\d+)'),
+            'TOW': (r'ETOW\s+(\d+)', r'MTOW\s+(\d+)'),
+            'LDW': (r'ELDW\s+(\d+)', r'MLDW\s+(\d+)')
+        }
+        
+        for key, (est_p, max_p) in patterns.items():
+            est_m = re.search(est_p, full_text)
+            max_m = re.search(max_p, full_text)
+            
+            if est_m and max_m:
+                est_val = int(est_m.group(1))
+                max_val = int(max_m.group(1))
+                margin = max_val - est_val
+                weights_found.append({
+                    'type': key,
+                    'est': est_val,
+                    'max': max_val,
+                    'margin': margin
+                })
+        
+        if weights_found:
+            # Sort by margin (ascending) to find the most restrictive
+            weights_found.sort(key=lambda x: x['margin'])
+            critical = weights_found[0]
+            
+            self.summary['limitacion_peso'] = critical['type']
+            self.summary['limitacion_valor'] = f"{critical['est']} / {critical['max']}"
+            self.summary['limitacion_margen'] = critical['margin']
+            self.summary['limitacion_critica'] = critical['margin'] < 1000
 
     def _extract_met_advanced(self, full_text):
         # METARs
