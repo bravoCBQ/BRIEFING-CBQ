@@ -42,7 +42,7 @@ class HighPrecisionPDFExtractor:
                     if i == 12: 
                         self._extract_flight_summary_line(text)
                     
-                    if "DEFERRED ITEM LIST" in text:
+                    if "DEFERRED ITEM LIST" in text or "Operational Limitations Report" in text:
                         self._extract_mel_advanced(text)
                 
                 self._extract_basic_info_fallback(full_text)
@@ -117,48 +117,109 @@ class HighPrecisionPDFExtractor:
                     self.summary['tripulacion'].append(f"{pos}: {name}")
 
     def _extract_mel_advanced(self, text):
-        # Re-evaluating MEL extraction from PÁGINA 3 format
-        # Sample: 33-41-01 MEL C L WING LIGHT INOP.
-        items = re.findall(r'(\d{2}-\d{2}-\d{2})\s+MEL\s+([A-D])\s+(.*?)(?=\s+\d{2}/\d{2}|PROCEDURE|$)', text)
-        for num, lvl, desc in items:
-            self.summary['mel_items'].append({
-                'number': num,
-                'level': lvl,
-                'description': desc.strip()
-            })
+        # 1. Search for MELs in the Operational Limitations Report or others
+        # We look for the pattern in each line first
+        lines = text.split('\n')
+        for i, line in enumerate(lines):
+            # Sample: 33-41-01 MEL C L WING LIGHT 31/01/2
+            match = re.search(r'(\d{2}-\d{2}-\d{2})\s+MEL\s+([A-D])\s+(.*)', line)
+            if match:
+                num, lvl, desc_part = match.group(1), match.group(2), match.group(3)
+                
+                # Exclude dates or common suffixes from the description part
+                # desc_part might reach the date: "L WING LIGHT 31/01/2 CREW CREW"
+                desc_clean = re.sub(r'\d{2}/\d{2}/\d{1,2}.*', '', desc_part).strip()
+                desc_clean = re.sub(r'CREW.*', '', desc_clean).strip()
+                desc_clean = re.sub(r'PROCEDURE.*', '', desc_clean).strip()
+                
+                # Check next line for additional description (e.g. "INOP.")
+                if i + 1 < len(lines):
+                    next_line = lines[i+1].strip()
+                    # If it looks like a continuation (not a new entry or header)
+                    if next_line and not re.search(r'\d{2}-\d{2}-\d{2}|MOC|---', next_line):
+                        # Some files have columns, we just want the text part
+                        # Description in next line is usually aligned
+                        next_part = re.sub(r'^\s*[\d\.\s]+\s+', '', lines[i+1])
+                        next_part_clean = re.sub(r'PROCEDURE.*|CREW.*', '', next_part).strip()
+                        if next_part_clean:
+                            desc_clean += " " + next_part_clean
+
+                if not any(item['number'] == num for item in self.summary['mel_items']):
+                    self.summary['mel_items'].append({
+                        'number': num,
+                        'level': lvl,
+                        'description': desc_clean
+                    })
 
     def _extract_turbulence(self, full_text):
-        # Look for the Nav Log section
-        # Format: [WAYPOINT] [NUM] [NUM]
-        # We also want to exclude "PAGE", "SIGMET", "creation", "UTC"
-        exclude = ["PAGE", "SIGMET", "UTC", "TIME", "FILE", "DATE"]
+        # Anchor-based Navigation Log Parser
         lines = full_text.split('\n')
         max_turb = 0
         max_loc = "N/A"
-        repeated = {}
-
-        for line in lines:
-            # Look for waypoint name (4-5 letters) followed by turbulence (1-2 digits) and Flight Level (3 digits)
-            match = re.search(r'\b([A-Z0-9]{4,5})\b\s+(\d{1,2})\b\s+(\d{3})\b', line)
-            if match:
-                wpt = match.group(1)
-                if any(x in wpt for x in exclude): continue
-                
-                turb = int(match.group(2))
-                if turb > max_turb:
-                    max_turb = turb
-                    max_loc = wpt
-                
-                if turb >= 5:
-                    t_str = str(turb)
-                    if t_str not in repeated:
-                        repeated[t_str] = []
-                    if wpt not in repeated[t_str]:
-                        repeated[t_str].append(wpt)
+        max_time = "N/A"
+        repeated = {} 
+        
+        last_posn = "N/A"
+        
+        for i in range(len(lines)):
+            line = lines[i].strip()
+            if not line: continue
+            
+            # Position identification: Starts with word (not coordinate)
+            posn_match = re.match(r'^([A-Z0-9]{3,7})\b', line)
+            # Avoid coordinate-like start and headers
+            if posn_match and not re.match(r'^[SN]\d{4}', line) and \
+               not any(x in line for x in ["PAGE", "LATAM", "RELEASE", "FREQ", "COORD", "POSN", "POS"]):
+                last_posn = posn_match.group(1)
+            
+            # Data line starts with coordinate
+            if re.match(r'^[SN]\d{4}', line):
+                wind_match = re.search(r'\b(\d{3}/\d{3})\b', line)
+                if wind_match:
+                    parts = line.split()
+                    try:
+                        # Find wind index
+                        wind_idx = -1
+                        for idx, p in enumerate(parts):
+                            if p == wind_match.group(1):
+                                wind_idx = idx
+                                break
+                        
+                        if wind_idx != -1 and len(parts) > wind_idx + 1:
+                            wsr_str = parts[wind_idx + 1]
+                            if wsr_str.isdigit():
+                                wsr = int(wsr_str)
+                                
+                                # ACT (Time) is 3 positions after WSR (DTGO, ACBOF, ACT)
+                                time_val = "N/A"
+                                if len(parts) > wind_idx + 4:
+                                    act = parts[wind_idx + 4]
+                                    if len(act) == 4 and act.isdigit():
+                                        time_val = f"{act[:2]}:{act[2:]}"
+                                
+                                if wsr > max_turb:
+                                    max_turb = wsr
+                                    max_loc = last_posn
+                                    max_time = time_val
+                                
+                                # Report all turbulences above 06 as requested
+                                if wsr >= 6:
+                                    t_str = str(wsr)
+                                    if t_str not in repeated:
+                                        repeated[t_str] = []
+                                    entry = {
+                                        'grado': wsr,
+                                        'punto': last_posn,
+                                        'eet': time_val
+                                    }
+                                    if not any(e['punto'] == last_posn and e['grado'] == wsr for e in repeated[t_str]):
+                                        repeated[t_str].append(entry)
+                    except (ValueError, IndexError):
+                        continue
 
         self.summary['turbulencia_max'] = f"{max_turb:02d}"
-        self.summary['turbulencia_loc'] = max_loc
-        self.summary['turbulencias_repetidas'] = {k: v for k, v in repeated.items() if len(v) > 1}
+        self.summary['turbulencia_loc'] = f"{max_loc} ({max_time})"
+        self.summary['turbulencias_repetidas'] = repeated
 
     def _extract_weights_advanced(self, full_text):
         # Extract pairs of (Estimated, Maximum)

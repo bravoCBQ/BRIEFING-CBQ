@@ -235,7 +235,7 @@ def main():
                         extra_turb += "- ⚠️ SEVERAS (>05): " + ", ".join([f"{t['punto']} ({t['eet']})" for t in summary["turbulencias_severas"]]) + "\n"
                     if summary.get("turbulencias_repetidas"):
                         for deg, pts in summary["turbulencias_repetidas"].items():
-                            extra_turb += f"- 🔄 REPETIDAS ({deg:02}): " + ", ".join([f"{t['punto']} ({t['eet']})" for t in pts]) + "\n"
+                            extra_turb += f"- 🔄 REPETIDAS ({int(deg):02}): " + ", ".join([f"{t['punto']} ({t['eet']})" for t in pts]) + "\n"
 
                     # Preparar texto de MEL
                     mel_text = ""
