@@ -23,7 +23,8 @@ class HighPrecisionPDFExtractor:
             'turbulencias_severas': [],
             'turbulencias_repetidas': {},
             'mel_items': [],
-            'meteorologia': []
+            'meteorologia': [],
+            'notams_criticos': []
         }
         self._extract_all()
 
@@ -45,10 +46,12 @@ class HighPrecisionPDFExtractor:
                     if "DEFERRED ITEM LIST" in text or "Operational Limitations Report" in text:
                         self._extract_mel_advanced(text)
                 
+                self.summary['notams_criticos'] = []
                 self._extract_basic_info_fallback(full_text)
                 self._extract_turbulence(full_text)
                 self._extract_weights_advanced(full_text)
                 self._extract_met_advanced(full_text)
+                self._extract_notams_advanced(full_text)
                 
         except Exception as e:
             print(f"Error extracting PDF data: {e}")
@@ -117,39 +120,121 @@ class HighPrecisionPDFExtractor:
                     self.summary['tripulacion'].append(f"{pos}: {name}")
 
     def _extract_mel_advanced(self, text):
-        # 1. Search for MELs in the Operational Limitations Report or others
-        # We look for the pattern in each line first
-        lines = text.split('\n')
-        for i, line in enumerate(lines):
-            # Sample: 33-41-01 MEL C L WING LIGHT 31/01/2
-            match = re.search(r'(\d{2}-\d{2}-\d{2})\s+MEL\s+([A-D])\s+(.*)', line)
-            if match:
-                num, lvl, desc_part = match.group(1), match.group(2), match.group(3)
+        # Ultra-robust MEL parser
+        # Capture all possible variations of MEL headers
+        sections = re.split(r'(\d{2}-\d{2}-\d{2})\s+MEL\s+([A-D])\s*', text)
+        
+        if len(sections) > 1:
+            for i in range(1, len(sections), 3):
+                num = sections[i]
+                lvl = sections[i+1]
+                content = sections[i+2]
                 
-                # Exclude dates or common suffixes from the description part
-                # desc_part might reach the date: "L WING LIGHT 31/01/2 CREW CREW"
-                desc_clean = re.sub(r'\d{2}/\d{2}/\d{1,2}.*', '', desc_part).strip()
-                desc_clean = re.sub(r'CREW.*', '', desc_clean).strip()
-                desc_clean = re.sub(r'PROCEDURE.*', '', desc_clean).strip()
+                # Take up to 6 lines to ensure we don't miss anything
+                content_lines = content.split('\n')[:6]
+                raw_full_text = " ".join([l.strip() for l in content_lines]).strip()
                 
-                # Check next line for additional description (e.g. "INOP.")
-                if i + 1 < len(lines):
-                    next_line = lines[i+1].strip()
-                    # If it looks like a continuation (not a new entry or header)
-                    if next_line and not re.search(r'\d{2}-\d{2}-\d{2}|MOC|---', next_line):
-                        # Some files have columns, we just want the text part
-                        # Description in next line is usually aligned
-                        next_part = re.sub(r'^\s*[\d\.\s]+\s+', '', lines[i+1])
-                        next_part_clean = re.sub(r'PROCEDURE.*|CREW.*', '', next_part).strip()
-                        if next_part_clean:
-                            desc_clean += " " + next_part_clean
+                # Heuristic cleanup: remove common PDF noise but keep potential description words
+                # Remove dates accurately
+                full_mel_text = re.sub(r'\d{2}/\d{2}/\d{1,4}', '', raw_full_text)
+                
+                # Remove PAGE/LATAM/RELEASE/MOC but don't strip everything
+                noise_patterns = [
+                    r'MOC\s*N?º?\s*\d+',
+                    r'PAGE\s+\d+',
+                    r'LATAM\s+OPERATIONAL.*?',
+                    r'MAINTENANCE\s+PROCEDURES.*?',
+                    r'CREW\s+PROCEDURE.*?',
+                    r'--+',
+                    r'BAR\s+CODE.*?',
+                    r'A/C\s+Registration.*?',
+                    r'Defect\s+Found.*?',
+                    r'Moc\s+No.*?',
+                    r'Open\s+Description.*?',
+                    r'Report.*?',
+                    r'Repetetive.*?'
+                ]
+                for p in noise_patterns:
+                    full_mel_text = re.sub(p, '', full_mel_text, flags=re.IGNORECASE)
+                
+                # Remove Registration patterns (usually 3 uppercase letters preceded by a number or space)
+                # Sample: "9 BGE", "CC-BGE", "97 BGF"
+                full_mel_text = re.sub(r'\b\d{1,3}\s+[A-Z]{3}\b', '', full_mel_text)
+                full_mel_text = re.sub(r'\bCC-[A-Z]{3}\b', '', full_mel_text)
+                
+                full_mel_text = re.sub(r'\s+', ' ', full_mel_text).strip()
+                
+                # Separation heuristic: Defect vs Description
+                # Try to find common status words like "INOP", "LIMIT", "RESTR", "FAIL"
+                status_split = re.split(r'\b(INOP|LIMIT|RESTR|FAIL|REQUIRED|ACTION)\b', full_mel_text, 1, flags=re.IGNORECASE)
+                
+                if len(status_split) > 1:
+                    defect = status_split[0].strip()
+                    description = (status_split[1] + status_split[2]).strip()
+                else:
+                    # If no obvious split word, use first 4 words as defect
+                    words = full_mel_text.split()
+                    if len(words) > 4:
+                        defect = " ".join(words[:4])
+                        description = " ".join(words[4:])
+                    else:
+                        defect = full_mel_text
+                        description = ""
 
                 if not any(item['number'] == num for item in self.summary['mel_items']):
                     self.summary['mel_items'].append({
                         'number': num,
                         'level': lvl,
-                        'description': desc_clean
+                        'defect': defect,
+                        'description': description
                     })
+
+    def _extract_notams_advanced(self, full_text):
+        # High-impact operational NOTAMs only
+        crit_patterns = [
+            r'RWY.*?CLOSED',
+            r'ILS.*?RWY.*?U/S',
+            r'ILS.*?U/S',
+            r'LOC.*?U/S',
+            r'GP.*?U/S',
+            r'CURFEW',
+            r'NOT\s+AVBL\s+FOR\s+DEPARTURE',
+            r'NORTH\s+END\s+CLOSED',
+            r'SOUTH\s+END\s+CLOSED',
+            r'SISTEMAS\s+INOP'
+        ]
+
+        lines = full_text.split('\n')
+        found_notams = []
+        current_apt = "UNKNOWN"
+
+        for i in range(len(lines)):
+            line = lines[i].strip()
+            l_up = line.upper()
+            
+            # Detect airport header (e.g., "SCEL -SCL - SANTIAGO INTL")
+            apt_match = re.match(r'^([A-Z]{4})\s+-\s*([A-Z]{3})?\s*-', l_up)
+            if apt_match:
+                current_apt = apt_match.group(1)
+
+            if any(re.search(p, l_up) for p in crit_patterns):
+                # Capture just the matching line and the one after for concise context
+                context = lines[i:min(len(lines), i+2)]
+                notam_text = " ".join([c.strip() for c in context]).strip()
+                notam_text = re.sub(r'\s+', ' ', notam_text)
+                
+                # Deduplicate and filter out obvious noisy strings
+                if notam_text and len(notam_text) > 10:
+                    # Final check: skip if it's just about TWY or secondary lights unless it mentions RWY CLOSED
+                    if 'TWY' in notam_text.upper() and 'RWY' not in notam_text.upper() and 'CLOSED' not in notam_text.upper():
+                        continue
+                    
+                    # Prefix with current airport
+                    full_entry = f"{current_apt}: {notam_text}"
+                    if full_entry not in found_notams:
+                        found_notams.append(full_entry)
+
+        self.summary['notams_criticos'] = found_notams
 
     def _extract_turbulence(self, full_text):
         # Anchor-based Navigation Log Parser
@@ -222,72 +307,43 @@ class HighPrecisionPDFExtractor:
         self.summary['turbulencias_repetidas'] = repeated
 
     def _extract_weights_advanced(self, full_text):
-        # Extract pairs of (Estimated, Maximum)
-        # Sample: EZFW 157867 ... MZFW 181436
-        # Sample: ETOW 252650 ... MTOW 252650
-        # Sample: ELDW 169741 ... MLDW 192776
-        
         weights_found = []
-        
         patterns = {
             'ZFW': (r'EZFW\s+(\d+)', r'MZFW\s+(\d+)'),
             'TOW': (r'ETOW\s+(\d+)', r'MTOW\s+(\d+)'),
             'LDW': (r'ELDW\s+(\d+)', r'MLDW\s+(\d+)')
         }
-        
         for key, (est_p, max_p) in patterns.items():
             est_m = re.search(est_p, full_text)
             max_m = re.search(max_p, full_text)
-            
             if est_m and max_m:
                 est_val = int(est_m.group(1))
                 max_val = int(max_m.group(1))
                 margin = max_val - est_val
-                weights_found.append({
-                    'type': key,
-                    'est': est_val,
-                    'max': max_val,
-                    'margin': margin
-                })
+                weights_found.append({'type': key, 'est': est_val, 'max': max_val, 'margin': margin})
         
         if weights_found:
-            # Sort by margin (ascending) to find the most restrictive
             weights_found.sort(key=lambda x: x['margin'])
             critical = weights_found[0]
-            
             self.summary['limitacion_peso'] = critical['type']
             self.summary['limitacion_valor'] = f"{critical['est']} / {critical['max']}"
             self.summary['limitacion_margen'] = critical['margin']
             self.summary['limitacion_critica'] = critical['margin'] < 1000
 
     def _extract_met_advanced(self, full_text):
-        # METARs
-        # Pattern: SCEL -SCL - SANTIAGO INTL
-        # followed by SA 020100Z ...
-        # Simplified: Find [ICAO] -[ANY] and then SA [TIME]
         sections = re.findall(r'([A-Z]{4})\s+-\s+.*?(?=([A-Z]{4}\s+-\s+|$))', full_text, re.DOTALL)
-        
         seen_airports = set()
         for apt, next_lookahead in sections:
             if apt in seen_airports or len(apt) != 4: continue
-            
-            # Find the block belonging to this apt
-            # We search for SA after the apt name until the next apt or EOF
             pattern = re.escape(apt) + r'\s+-.*?SA\s+\d{6}Z\s+(.*?)(?=[A-Z]{4}\s+-\s+|$)'
             sa_match = re.search(pattern, full_text, re.DOTALL)
-            
             if sa_match:
                 metar_text = sa_match.group(1)
-                # Extract visibility: 9999, 4000, 0800, CAVOK, 1/4SM
                 vis_match = re.search(r'\b(\d{4}|CAVOK)\b', metar_text)
                 if vis_match:
                     vis = vis_match.group(1)
                     vis_val = 9999 if vis == 'CAVOK' else int(vis)
-                    self.summary['meteorologia'].append({
-                        'airport': apt,
-                        'visibility': vis_val,
-                        'low_vis': vis_val < 2000
-                    })
+                    self.summary['meteorologia'].append({'airport': apt, 'visibility': vis_val, 'low_vis': vis_val < 2000})
                     seen_airports.add(apt)
 
 

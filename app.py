@@ -64,6 +64,16 @@ st.markdown("""
     .normal-vis {
         background-color: #28a745;
     }
+    .notam-item {
+        background-color: #fff3cd;
+        padding: 12px;
+        border-radius: 8px;
+        margin-bottom: 10px;
+        border-left: 5px solid #ffc107;
+        color: #856404;
+        font-size: 0.9em;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+    }
     @keyframes pulse {
         0% { opacity: 1; }
         50% { opacity: 0.7; }
@@ -90,6 +100,20 @@ def main():
     st.sidebar.info("Para usar en tu celular, conéctalo al mismo Wi-Fi y usa la URL de red que aparece en la terminal.")
 
     st.title("✈️ PDF Flight Extractor Pro")
+    
+    with st.expander("ℹ️ ¿Qué información extrae esta herramienta?", expanded=False):
+        st.markdown("""
+        Esta aplicación analiza automáticamente tu **PDF de despacho** para entregarte un resumen operativo crítico de alta precisión:
+        
+        *   **📊 Resumen Operativo**: Datos de vuelo, matrícula y duración estimada.
+        *   **⚖️ Limitaciones de Peso**: Identifica la limitación más restrictiva (MZFW, MTOW o MLDW) basándose en los márgenes calculados.
+        *   **🛠️ Mantenimiento (MEL)**: Extrae ítems del reporte de limitaciones operacionales, detallando el defecto y su descripción.
+        *   **🌡️ Meteorología**: Vientos de arribo y alertas visuales si la visibilidad es inferior a 2000m.
+        *   **🌪️ Turbulencia (Nav Log)**: Captura la turbulencia máxima y reporta todas las variaciones grado **06 o superior** con su waypoint y hora (`ACT`).
+        *   **⚠️ NOTAMs Críticos**: Filtra automáticamente cierres de pista, fallas de sistemas (ILS, Luces) y restricciones de aproximación.
+        *   **👥 Tripulación**: Identifica a todos los miembros de la tripulación técnica por rol.
+        """)
+    
     st.markdown("---")
 
     uploaded_file = st.file_uploader("Sube tu archivo PDF de vuelo", type="pdf")
@@ -204,7 +228,8 @@ def main():
                                 st.markdown(f"""
                                     <div class="mel-item">
                                         <b style="color: #007bff;">{item['number']} (Level {item['level']})</b><br>
-                                        <span style="font-size: 0.9em; color: #444;">{item['description']}</span>
+                                        <span style="font-size: 0.9em; color: #444;"><b>Defecto:</b> {item.get('defect', 'N/A')}</span><br>
+                                        <span style="font-size: 0.85em; color: #666;"><b>Resumen:</b> {item.get('description', 'N/A')}</span>
                                     </div>
                                 """, unsafe_allow_html=True)
                         else:
@@ -240,7 +265,12 @@ def main():
                     # Preparar texto de MEL
                     mel_text = ""
                     if summary.get("mel_items"):
-                        mel_text = "🛠️ MEL ITEMS:\n" + "\n".join([f"- {m['number']} ({m['level']}): {m['description']}" for m in summary['mel_items']]) + "\n\n"
+                        mel_text = "🛠️ MEL ITEMS:\n" + "\n".join([f"- {m['number']} ({m['level']}): {m['defect']} | {m['description']}" for m in summary['mel_items']]) + "\n\n"
+
+                    # Preparar texto de NOTAMs
+                    notam_text = ""
+                    if summary.get("notams_criticos"):
+                        notam_text = "⚠️ NOTAMs CRÍTICOS:\n" + "\n".join([f"- {n}" for n in summary['notams_criticos']]) + "\n\n"
 
                     # Preparar texto de Meteorología
                     met_text = ""
@@ -253,6 +283,7 @@ def main():
                         f"Matrícula: {summary['matricula']}\n"
                         f"Tiempo: {summary['tiempo_vuelo']}\n\n"
                         f"{mel_text}"
+                        f"{notam_text}"
                         f"{met_text}"
                         f"⚖️ LIMITACIONES DE PESO:\n"
                         f"- Limitación: {summary['limitacion_peso']} ({summary['limitacion_valor']})\n"
@@ -266,6 +297,15 @@ def main():
                         f"👥 TRIPULACIÓN:\n" + "\n".join([f"- {p}" for p in summary['tripulacion']])
                     )
                     st.text_area("📋 Resumen para copiar:", value=summary_text, height=400)
+
+                    # --- SECCIÓN FINAL DE NOTAMS ---
+                    st.markdown("---")
+                    st.subheader("⚠️ NOTAMs Críticos (Restricciones Operacionales)")
+                    if summary.get("notams_criticos"):
+                        for notam in summary["notams_criticos"]:
+                            st.markdown(f'<div class="notam-item">{notam}</div>', unsafe_allow_html=True)
+                    else:
+                        st.success("No se detectaron restricciones críticas en los NOTAMs (Cierres de pista, ILS U/S, etc.)")
 
                 except Exception as e:
                     st.error(f"Error: {e}")
